@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+.gitconfig
+
+# Ollama (local models + keys)
+.ollama/
+ollama/
+
+# Rust / Cargo cache
+.cargo/
+target/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# VS / IDE
+.vs/

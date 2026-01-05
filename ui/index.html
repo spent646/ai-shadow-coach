@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Shadow Coach</title>
+  </head>
+  <body style="font-family: Arial, sans-serif;">
+    <h3>Starting Shadow Coach…</h3>
+    <p id="status">Waiting for backend…</p>
+
+    <script type="module">
+      const status = document.getElementById("status");
+      const health = "/state"; // ✅ relative (no hardcoded port)
+
+      async function waitForBackend() {
+        for (let i = 0; i < 60; i++) {
+          try {
+            const res = await fetch(health, { cache: "no-store" });
+            if (res.ok) {
+              status.textContent = "Backend ready. Loading…";
+              window.location.replace("/"); // ✅ relative
+              return;
+            }
+          } catch {}
+          status.textContent = `Waiting for backend… (${i + 1}/60)`;
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        status.textContent = "Backend did not start. Check backend_err.log.";
+      }
+
+      waitForBackend();
+    </script>
+  </body>
+</html>

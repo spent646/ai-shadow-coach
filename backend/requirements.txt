@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+openai
+httpx
+aiohttp==3.9.5
+websockets==12.0

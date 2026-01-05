@@ -1,0 +1,297 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Shadow Coach</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 16px; }
+    .muted { color:#666; font-size:12px; }
+    .row { display:flex; gap:12px; flex-wrap: wrap; align-items: end; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+    @media (max-width: 900px){ .grid { grid-template-columns: 1fr; } }
+    .card { border:1px solid #ddd; border-radius: 12px; padding: 12px; }
+    input, select, textarea, button { padding: 8px; border-radius: 8px; border:1px solid #ccc; }
+    textarea { width: 100%; height: 70px; }
+    button { cursor:pointer; }
+    button.primary { background:#111; color:#fff; border-color:#111; }
+    button.danger { background:#b00020; color:#fff; border-color:#b00020; }
+    pre { white-space: pre-wrap; word-break: break-word; background:#fafafa; border:1px solid #eee; padding:10px; border-radius: 10px; }
+    .turns { max-height: 360px; overflow:auto; border:1px solid #eee; border-radius:10px; padding:10px; background:#fff; }
+    .pill { display:inline-block; font-size: 12px; padding: 3px 8px; border-radius: 999px; border: 1px solid #ddd; margin-right:8px; }
+    .pillA { background:#f4f4ff; }
+    .pillB { background:#fff5f0; }
+    .meterWrap { width: 360px; }
+    .meterLabel { font-size: 12px; margin-bottom: 6px; }
+    .meter { height: 12px; background:#eee; border-radius: 999px; overflow:hidden; border:1px solid #ddd; }
+    .meter > div { height: 100%; width: 0%; background:#111; }
+    .partialLine { margin-top: 6px; }
+  </style>
+</head>
+
+<body>
+  <h2>Shadow Coach</h2>
+  <div class="muted">If you see Deepgram 403 “Access denied”, it’s usually VPN/firewall. Turn VPN off.</div>
+
+  <div class="card">
+    <div class="row">
+      <div style="min-width: 260px;">
+        <div class="muted">Topic</div>
+        <input id="topic" value="Gun policy" style="width:100%;" />
+      </div>
+      <div style="min-width: 420px; flex: 1;">
+        <div class="muted">Scope</div>
+        <input id="scope" value="Discuss US gun policy: background checks, licensing, carry, bans, enforcement, and constitutional arguments." style="width:100%;" />
+      </div>
+      <button class="primary" id="setTopicBtn">Set topic</button>
+      <button class="danger" id="clearBtn">Clear conversation</button>
+    </div>
+
+    <hr style="border:none;border-top:1px solid #eee; margin:12px 0;">
+
+    <div class="row">
+      <div style="min-width: 360px;">
+        <div class="muted">Mic device (Speaker A)</div>
+        <select id="micSelect" style="width:100%;"></select>
+      </div>
+
+      <div style="min-width: 360px;">
+        <div class="muted">Voicemeeter device (Speaker B)</div>
+        <select id="vmSelect" style="width:100%;"></select>
+      </div>
+
+      <button class="primary" id="startBtn">Start Audio</button>
+      <button id="stopBtn">Stop Audio</button>
+      <button class="primary" id="deepBtn">Deep Analysis (Paid)</button>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
+      <div class="meterWrap">
+        <div class="meterLabel">Mic (A): <span id="micStatus" class="muted"></span></div>
+        <div class="meter"><div id="micMeter"></div></div>
+        <div class="muted partialLine" id="micPartial"></div>
+      </div>
+
+      <div class="meterWrap">
+        <div class="meterLabel">Voicemeeter (B): <span id="vmStatus" class="muted"></span></div>
+        <div class="meter"><div id="vmMeter"></div></div>
+        <div class="muted partialLine" id="vmPartial"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Transcript (final lines)</h3>
+      <div class="turns" id="turns"></div>
+
+      <hr style="border:none;border-top:1px solid #eee; margin:12px 0;">
+
+      <h3>Typed Input (optional)</h3>
+      <div class="row">
+        <div style="min-width:160px;">
+          <div class="muted">Speaker</div>
+          <select id="speaker" style="width:100%;">
+            <option value="A">Speaker A</option>
+            <option value="B">Speaker B</option>
+          </select>
+        </div>
+        <div style="flex:1; min-width: 280px;">
+          <div class="muted">Line</div>
+          <textarea id="line" placeholder="Type a statement..."></textarea>
+        </div>
+      </div>
+      <button id="addLineBtn">Add line</button>
+    </div>
+
+    <div class="card">
+      <h3>Coach</h3>
+      <div class="muted">Live from <code>/state</code> → <code>last_coach</code></div>
+      <div class="muted" id="providerInfo"></div>
+      <pre id="coachOut">{}</pre>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  // Adjust these once you confirm indices on THIS machine
+  const DEFAULT_MIC_INDEX = 59;
+  const DEFAULT_VM_INDEX  = 33; // ✅ start Speaker B on 33
+
+  function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+  function rmsToPercent(rms){
+    const scaled = clamp01((rms || 0) * 80);
+    return Math.round(scaled * 100);
+  }
+
+  async function api(path, opts){
+    const res = await fetch(path, opts);
+    if(!res.ok){
+      const txt = await res.text();
+      throw new Error(`${res.status} ${res.statusText}: ${txt}`);
+    }
+    return res.json();
+  }
+
+  async function loadDevices(){
+    const data = await api("/audio/devices");
+    const devices = data.devices || [];
+    const inputs = devices.filter(d => (d.max_input_channels || 0) > 0);
+
+    const micSel = $("micSelect");
+    const vmSel  = $("vmSelect");
+    micSel.innerHTML = "";
+    vmSel.innerHTML  = "";
+
+    for(const d of inputs){
+      const label = `${d.index} — ${d.name}`;
+
+      const opt1 = document.createElement("option");
+      opt1.value = d.index;
+      opt1.textContent = label;
+
+      const opt2 = document.createElement("option");
+      opt2.value = d.index;
+      opt2.textContent = label;
+
+      micSel.appendChild(opt1);
+      vmSel.appendChild(opt2);
+    }
+
+    if(inputs.some(d => d.index === DEFAULT_MIC_INDEX)) micSel.value = String(DEFAULT_MIC_INDEX);
+    if(inputs.some(d => d.index === DEFAULT_VM_INDEX))  vmSel.value  = String(DEFAULT_VM_INDEX);
+  }
+
+  async function setTopic(){
+    await api("/set_topic", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ topic: $("topic").value, scope: $("scope").value })
+    });
+  }
+
+  async function clearConversation(){
+    await api("/clear", { method:"POST" });
+  }
+
+  async function startAudio(){
+    const mic = parseInt($("micSelect").value, 10);
+    const vm  = parseInt($("vmSelect").value, 10);
+
+    await api("/audio/start", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ mic_device_index: mic, vm_device_index: vm })
+    });
+  }
+
+  async function stopAudio(){
+    await api("/audio/stop", { method:"POST" });
+  }
+
+  async function addLine(){
+    const speaker = $("speaker").value;
+    const text = $("line").value.trim();
+    if(!text) return;
+
+    await api("/add_line", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ speaker, text })
+    });
+
+    $("line").value = "";
+  }
+
+  function renderTurns(turns){
+    const container = $("turns");
+    container.innerHTML = "";
+    const slice = (turns || []).slice(-120);
+    for(const t of slice){
+      const div = document.createElement("div");
+      div.style.margin = "8px 0";
+
+      const pill = document.createElement("span");
+      pill.className = "pill " + (t.speaker === "A" ? "pillA" : "pillB");
+      pill.textContent = t.speaker;
+
+      const text = document.createElement("span");
+      text.textContent = t.text;
+
+      div.appendChild(pill);
+      div.appendChild(text);
+      container.appendChild(div);
+    }
+    container.scrollTop = container.scrollHeight;
+  }
+
+  async function poll(){
+    // audio status
+    try{
+      const st = await api("/audio/status");
+      $("micStatus").textContent = st.mic.status || "";
+      $("vmStatus").textContent  = st.vm.status || "";
+      $("micMeter").style.width = rmsToPercent(st.mic.rms) + "%";
+      $("vmMeter").style.width  = rmsToPercent(st.vm.rms) + "%";
+
+      // ✅ shows interim text even when Deepgram is not finalizing often
+      $("micPartial").textContent = st.mic.partial ? ("Live: " + st.mic.partial) : "";
+      $("vmPartial").textContent  = st.vm.partial  ? ("Live: " + st.vm.partial)  : "";
+    } catch(e){
+      $("micStatus").textContent = "audio status error";
+      $("vmStatus").textContent  = "audio status error";
+      $("micPartial").textContent = "";
+      $("vmPartial").textContent  = "";
+    }
+
+    // state + coach + transcript
+    try{
+      const s = await api("/state");
+      renderTurns(s.turns || []);
+      $("coachOut").textContent = JSON.stringify(s.last_coach || {}, null, 2);
+      $("providerInfo").textContent =
+        `Live: ${s.coach_live_provider ?? ""}  •  Deep: ${s.coach_deep_provider ?? ""}  •  Debounce: ${s.coach_debounce_seconds ?? ""}s`;
+    } catch(e){
+      // ignore
+    }
+  }
+
+  $("setTopicBtn").addEventListener("click", async () => {
+    try { await setTopic(); }
+    catch(e){ alert("Set topic failed: " + e.message); }
+  });
+
+  $("clearBtn").addEventListener("click", async () => {
+    try { await clearConversation(); }
+    catch(e){ alert("Clear failed: " + e.message); }
+  });
+
+  $("startBtn").addEventListener("click", async () => {
+    try { await startAudio(); }
+    catch(e){ alert("Start failed: " + e.message); }
+  });
+
+  $("deepBtn").addEventListener("click", async () => {
+    try { await api("/deep_analysis", { method:"POST" }); }
+    catch(e){ alert("Deep analysis failed: " + e.message); }
+  });
+
+  $("stopBtn").addEventListener("click", async () => {
+    try { await stopAudio(); }
+    catch(e){ alert("Stop failed: " + e.message); }
+  });
+
+  $("addLineBtn").addEventListener("click", async () => {
+    try { await addLine(); }
+    catch(e){ alert("Add line failed: " + e.message); }
+  });
+
+  (async function init(){
+    await loadDevices();
+    await poll();
+    setInterval(poll, 900);
+  })();
+</script>
+</body>
+</html>
