@@ -4,25 +4,19 @@ import asyncio
 import json
 import os
 import queue
-import sys
-import time
 import threading
+import time
 import multiprocessing as mp
 from dataclasses import dataclass
-from typing import Callable, Optional, Dict, Any, Tuple
+from typing import Callable, Optional, Dict, Any
 
 import aiohttp
 from multiprocessing.connection import Listener
 
-# IMPORTANT: sounddevice is ONLY used in the capture subprocess now.
-# This avoids Windows GIL starvation between PortAudio callbacks and websocket send/recv.
 from audio_capture_proc import run_capture_proc
 
+
 def list_audio_devices():
-    """
-    Returns available INPUT audio devices.
-    This is used by main.py / UI for device selection.
-    """
     import sounddevice as sd
 
     devices = []
@@ -30,7 +24,6 @@ def list_audio_devices():
         for idx, d in enumerate(sd.query_devices()):
             if int(d.get("max_input_channels", 0)) <= 0:
                 continue
-
             devices.append(
                 {
                     "index": idx,
@@ -40,16 +33,10 @@ def list_audio_devices():
                 }
             )
     except Exception as e:
-        return {
-            "ok": False,
-            "error": repr(e),
-            "devices": [],
-        }
+        return {"ok": False, "error": repr(e), "devices": []}
 
-    return {
-        "ok": True,
-        "devices": devices,
-    }
+    return {"ok": True, "devices": devices}
+
 
 DEEPGRAM_URL_BASE = (
     "wss://api.deepgram.com/v1/listen"
@@ -64,8 +51,6 @@ DEEPGRAM_URL_BASE = (
     "&vad_events=true"
 )
 
-MAX_BATCH = 32
-
 
 def build_deepgram_url(sample_rate: int) -> str:
     sr = int(sample_rate) if sample_rate else 48000
@@ -75,14 +60,12 @@ def build_deepgram_url(sample_rate: int) -> str:
 @dataclass
 class StreamConfig:
     device_index: int
-    label: str          # "mic" or "vm"
-    speaker: str        # "A" or "B"
+    label: str
+    speaker: str
     sample_rate: int = 48000
-    blocksize: int = 960   # ~20ms @ 48k
-    channels: int = 2      # capture in stereo; downmix in child using LEFT channel only
+    blocksize: int = 960
+    channels: int = 2
 
-
-# -------------------- Worker Process (Deepgram + IPC receiver) --------------------
 
 def _stream_worker_process(
     cfg: StreamConfig,
@@ -91,24 +74,14 @@ def _stream_worker_process(
     status_q: "mp.Queue[Dict[str, Any]]",
     text_q: "mp.Queue[Dict[str, str]]",
 ):
-    """
-    One process per stream:
-      - Spawns a CAPTURE subprocess that runs sounddevice and sends PCM frames over IPC
-      - This worker process runs Deepgram websocket + receives PCM via IPC
-      - Emits transcript events to parent via text_q
-      - Pushes health/status snapshots to parent via status_q
-    This fully decouples PortAudio callbacks from websocket + asyncio on Windows.
-    """
+    pcm_q: "queue.Queue[bytes]" = queue.Queue(maxsize=2000)
 
-    # Local (in-process) queue of PCM16 chunks (from capture proc)
-    q: "queue.Queue[bytes]" = queue.Queue(maxsize=2000)
-
-    # Stats
     level = 0.0
     queue_drops = 0
     bytes_sent = 0
     msgs_recv = 0
     emit_count = 0
+
     last_partial = ""
     last_final = ""
     last_emit_text = ""
@@ -125,10 +98,8 @@ def _stream_worker_process(
     last_recv_ts = 0.0
     last_emit_ts = 0.0
 
-    # Backpressure settings inside worker
-    q_soft_cap = 200  # keep WS live; drop oldest if behind
+    q_soft_cap = 200
 
-    # Capture proc plumbing
     ctx = mp.get_context("spawn")
     listener: Optional[Listener] = None
     conn = None
@@ -136,11 +107,7 @@ def _stream_worker_process(
     ipc_connected = False
 
     def push_status(extra: Optional[Dict[str, Any]] = None):
-        nonlocal level, queue_drops, bytes_sent, msgs_recv, emit_count
-        nonlocal last_partial, last_final, last_emit_text, last_dg_type, last_dg_error, last_ws_close
-        nonlocal last_capture_log, last_capture_err, last_dg_raw, last_dg_no_transcript
-        nonlocal last_audio_ts, last_send_ts, last_recv_ts, ipc_connected, cap_proc
-
+        nonlocal ipc_connected, cap_proc
         now = time.time()
         payload = {
             "ts": now,
@@ -152,7 +119,7 @@ def _stream_worker_process(
             "bytes_sent": int(bytes_sent),
             "msgs_recv": int(msgs_recv),
             "queue_drops": int(queue_drops),
-            "queue_size": int(q.qsize()),
+            "queue_size": int(pcm_q.qsize()),
             "last_emit_text": last_emit_text,
             "last_dg_type": last_dg_type,
             "last_dg_error": last_dg_error,
@@ -187,7 +154,7 @@ def _stream_worker_process(
         except Exception:
             pass
 
-    def start_capture_proc() -> Tuple[Listener, mp.Process]:
+    def start_capture_proc():
         nonlocal listener, cap_proc, ipc_connected
         listener = Listener(("127.0.0.1", 0), authkey=b"shadowcoach")
         host, port = listener.address
@@ -198,22 +165,23 @@ def _stream_worker_process(
         )
         cap_proc.start()
         ipc_connected = False
-        return listener, cap_proc
 
     async def ipc_reader():
-        """
-        Receive ("pcm", ts, rms, bytes) from capture proc and push into q.
-        """
         nonlocal conn, ipc_connected, level, last_audio_ts, last_capture_log, last_capture_err, queue_drops
-        # Accept connection (blocking) in a thread so asyncio loop stays responsive.
+        assert listener is not None
+
         def _accept():
             return listener.accept()
 
-        conn = await asyncio.get_running_loop().run_in_executor(None, _accept)
-        ipc_connected = True
+        try:
+            conn = await asyncio.get_running_loop().run_in_executor(None, _accept)
+            ipc_connected = True
+        except Exception as e:
+            last_capture_err = f"ipc_accept_error: {repr(e)}"
+            ipc_connected = False
+            return
 
         while not stop_evt.is_set():
-            # poll with small timeout to allow cancellation
             try:
                 if conn.poll(0.1):
                     msg = conn.recv()
@@ -238,15 +206,15 @@ def _stream_worker_process(
                 last_audio_ts = float(ts)
                 level = float(rms)
 
-                # backpressure: drop oldest if behind to keep audio current
-                try:
-                    if q.qsize() >= q_soft_cap:
-                        try:
-                            _ = q.get_nowait()
-                        except queue.Empty:
-                            pass
+                if pcm_q.qsize() >= q_soft_cap:
+                    try:
+                        _ = pcm_q.get_nowait()
                         queue_drops += 1
-                    q.put_nowait(pcm16)
+                    except queue.Empty:
+                        pass
+
+                try:
+                    pcm_q.put_nowait(pcm16)
                 except queue.Full:
                     queue_drops += 1
 
@@ -264,29 +232,37 @@ def _stream_worker_process(
 
         url = build_deepgram_url(cfg.sample_rate)
         headers = {"Authorization": f"Token {deepgram_key}"}
-
         timeout = aiohttp.ClientTimeout(total=None)
+
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.ws_connect(url, heartbeat=20) as ws:
 
                 async def sender():
                     nonlocal bytes_sent, last_send_ts
-                    while not stop_evt.is_set():
-                        batch = []
-                        for _ in range(MAX_BATCH):
-                            try:
-                                batch.append(q.get_nowait())
-                            except queue.Empty:
-                                break
+                    frames_per_chunk = int(cfg.blocksize)
+                    sr = int(cfg.sample_rate)
+                    chunk_seconds = frames_per_chunk / float(sr)
 
-                        if not batch:
-                            await asyncio.sleep(0.005)
+                    next_send_time = time.time()
+
+                    while not stop_evt.is_set():
+                        try:
+                            chunk = pcm_q.get_nowait()
+                        except queue.Empty:
+                            await asyncio.sleep(0.001)
                             continue
 
-                        for chunk in batch:
-                            await ws.send_bytes(chunk)
-                            bytes_sent += len(chunk)
-                            last_send_ts = time.time()
+                        await ws.send_bytes(chunk)
+                        bytes_sent += len(chunk)
+                        last_send_ts = time.time()
+
+                        next_send_time += chunk_seconds
+                        now = time.time()
+                        delay = next_send_time - now
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        else:
+                            next_send_time = now
 
                 async def receiver():
                     nonlocal msgs_recv, last_recv_ts
@@ -297,9 +273,11 @@ def _stream_worker_process(
                         msg = await ws.receive()
 
                         if msg.type == aiohttp.WSMsgType.CLOSED:
-                            raise RuntimeError("WebSocket closed")
+                            last_ws_close = f"WebSocket closed code={ws.close_code}"
+                            raise RuntimeError(last_ws_close)
                         if msg.type == aiohttp.WSMsgType.ERROR:
-                            raise RuntimeError(f"WebSocket error: {ws.exception()}")
+                            last_ws_close = f"WebSocket error: {ws.exception()}"
+                            raise RuntimeError(last_ws_close)
 
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             continue
@@ -308,7 +286,6 @@ def _stream_worker_process(
                         last_recv_ts = time.time()
 
                         raw = msg.data
-                        # keep a small rolling sample
                         last_dg_raw = (raw[:600] if isinstance(raw, str) else str(raw)[:600])
 
                         try:
@@ -325,7 +302,6 @@ def _stream_worker_process(
                         if "error" in data or msg_type.lower() == "error":
                             last_dg_error = json.dumps(data)[:800]
 
-                        # Extract transcript
                         transcript = ""
                         chan = data.get("channel")
                         if isinstance(chan, dict):
@@ -349,20 +325,6 @@ def _stream_worker_process(
                         else:
                             last_partial = transcript
 
-                            # Partial emit rule
-                            now = time.time()
-                            last = last_emit_text
-                            has_audio = level > 0.01  # RMS scale 0..1
-
-                            grew = len(transcript) >= max(8, len(last) + 6) and transcript != last
-                            time_ready = (now - last_emit_ts) > 1.0
-
-                            identical = (transcript == last)
-                            dup_cooldown_ok = (now - last_emit_ts) > 2.0
-
-                            if has_audio and (grew or (time_ready and (not identical or dup_cooldown_ok))):
-                                emit_text(transcript)
-
                 async def status_pumper():
                     while not stop_evt.is_set():
                         push_status()
@@ -381,60 +343,39 @@ def _stream_worker_process(
                     if exc:
                         raise exc
 
-    # Run worker
+    loop: Optional[asyncio.AbstractEventLoop] = None
     try:
         push_status({"status": "starting"})
         start_capture_proc()
 
-        # Dedicated loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+
+        ipc_task = loop.create_task(ipc_reader())
+
+        t0 = time.time()
+        while not ipc_connected and (time.time() - t0) < 2.0 and not stop_evt.is_set():
+            loop.run_until_complete(asyncio.sleep(0.05))
 
         backoff = 0.5
         while not stop_evt.is_set():
             try:
-                last_ws_close = ""
                 push_status({"status": "connecting"})
-
-                # Start IPC reader + Deepgram concurrently
-                tasks = [
-                    loop.create_task(ipc_reader()),
-                    loop.create_task(dg_loop()),
-                ]
-                done, pending = loop.run_until_complete(asyncio.wait(set(tasks), return_when=asyncio.FIRST_EXCEPTION))
-                for t in pending:
-                    t.cancel()
-                for t in done:
-                    exc = t.exception()
-                    if exc:
-                        raise exc
-
+                loop.run_until_complete(dg_loop())
                 backoff = 0.5
             except Exception as e:
                 last_ws_close = repr(e)
                 push_status({"status": "ws_error", "last_ws_close": last_ws_close})
-
-                # If IPC died, restart capture proc
-                try:
-                    if cap_proc and cap_proc.is_alive():
-                        cap_proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    if listener:
-                        listener.close()
-                except Exception:
-                    pass
-                time.sleep(0.2)
-                try:
-                    start_capture_proc()
-                except Exception as e2:
-                    last_capture_err = f"restart_capture_failed: {repr(e2)}"
-
                 time.sleep(backoff)
                 backoff = min(5.0, backoff * 1.7)
 
-        # shutdown
+        if not ipc_task.done():
+            ipc_task.cancel()
+
+    except Exception as e:
+        push_status({"status": "audio_error", "capture_error": repr(e)})
+
+    finally:
         try:
             if cap_proc and cap_proc.is_alive():
                 cap_proc.terminate()
@@ -450,28 +391,17 @@ def _stream_worker_process(
                 listener.close()
         except Exception:
             pass
-
         try:
-            loop.stop()
-            loop.close()
+            if loop:
+                loop.stop()
+                loop.close()
         except Exception:
             pass
 
-    except Exception as e:
-        push_status({"status": "audio_error", "capture_error": repr(e)})
+        push_status({"status": "stopped"})
 
-    push_status({"status": "stopped"})
-
-
-# -------------------- Parent-side Controller --------------------
 
 class ProcessStreamController:
-    """
-    Parent-side wrapper around a worker process.
-    If the worker freezes (send/recv age grows while audio is active),
-    parent terminates & restarts the process.
-    """
-
     def __init__(self, cfg: StreamConfig, deepgram_key: str, on_text: Callable[[str, str], None]):
         self.cfg = cfg
         self.deepgram_key = deepgram_key
@@ -485,9 +415,7 @@ class ProcessStreamController:
 
         self._stop_threads = threading.Event()
         self._pump_thread: Optional[threading.Thread] = None
-        self._monitor_thread: Optional[threading.Thread] = None
 
-        # Latest status snapshot exposed to /audio/status
         self.latest: Dict[str, Any] = {
             "status": "stopped",
             "rms": 0.0,
@@ -512,15 +440,19 @@ class ProcessStreamController:
             "last_dg_raw": "",
             "last_dg_no_transcript": 0,
             "capture_error": "",
+            # NEW parent-side fields
+            "worker_pid": None,
+            "worker_alive": False,
+            "worker_exitcode": None,
         }
 
-        # Freeze detection thresholds
-        self._freeze_ms = 12_000      # if send/recv age exceeds this...
-        self._freeze_audio_ms = 1500  # ...while audio is active (age < this)
-        self._freeze_queue_min = 5    # ...and there's queued audio
-
     def start(self):
-        self.stop()  # hard reset any old one
+        self.stop()
+        self.latest["status"] = "starting"
+        self.latest["capture_error"] = ""
+        self.latest["worker_pid"] = None
+        self.latest["worker_alive"] = False
+        self.latest["worker_exitcode"] = None
 
         self._stop.clear()
         self._stop_threads.clear()
@@ -528,15 +460,17 @@ class ProcessStreamController:
         self._proc = self._ctx.Process(
             target=_stream_worker_process,
             args=(self.cfg, self.deepgram_key, self._stop, self._status_q, self._text_q),
-            daemon=True,
+            daemon=False,
         )
         self._proc.start()
 
+        # record immediately
+        self.latest["worker_pid"] = self._proc.pid
+        self.latest["worker_alive"] = self._proc.is_alive()
+        self.latest["worker_exitcode"] = self._proc.exitcode
+
         self._pump_thread = threading.Thread(target=self._pump_loop, daemon=True)
         self._pump_thread.start()
-
-        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self._monitor_thread.start()
 
     def stop(self):
         self._stop_threads.set()
@@ -548,27 +482,38 @@ class ProcessStreamController:
         if self._proc and self._proc.is_alive():
             try:
                 self._proc.terminate()
+                self._proc.join(timeout=1.5)
             except Exception:
                 pass
 
         self._proc = None
         self.latest["status"] = "stopped"
+        self.latest["worker_alive"] = False
+        self.latest["worker_exitcode"] = None
+        self.latest["worker_pid"] = None
 
     def _pump_loop(self):
-        # Move text + status from queues into parent state
         while not self._stop_threads.is_set():
-            # status
+            # Update parent-side process health every tick
+            if self._proc:
+                self.latest["worker_pid"] = self._proc.pid
+                self.latest["worker_alive"] = self._proc.is_alive()
+                self.latest["worker_exitcode"] = self._proc.exitcode
+
+                # If process died, surface it hard
+                if (not self._proc.is_alive()) and self._proc.exitcode is not None:
+                    self.latest["status"] = "audio_error"
+                    self.latest["capture_error"] = f"worker_exitcode={self._proc.exitcode}"
+
             try:
                 while True:
                     s = self._status_q.get_nowait()
                     for k, v in s.items():
-                        if k == "ts":
-                            continue
-                        self.latest[k] = v
+                        if k != "ts":
+                            self.latest[k] = v
             except Exception:
                 pass
 
-            # text
             try:
                 while True:
                     t = self._text_q.get_nowait()
@@ -580,37 +525,6 @@ class ProcessStreamController:
                 pass
 
             time.sleep(0.05)
-
-    def _monitor_loop(self):
-        # If worker freezes, kill/restart it
-        while not self._stop_threads.is_set():
-            st = self.latest
-
-            try:
-                audio_age = st.get("audio_age_ms")
-                send_age = st.get("send_age_ms")
-                recv_age = st.get("recv_age_ms")
-                qsz = st.get("queue_size", 0)
-                status = (st.get("status") or "").lower()
-
-                frozen = False
-                if status in ("streaming", "connecting", "ws_error"):
-                    if audio_age is not None and audio_age < self._freeze_audio_ms and qsz >= self._freeze_queue_min:
-                        if (send_age is not None and send_age > self._freeze_ms) or (recv_age is not None and recv_age > self._freeze_ms):
-                            frozen = True
-
-                if frozen:
-                    st["last_ws_close"] = f"ParentRestart: frozen (send_age={send_age}, recv_age={recv_age}, q={qsz})"
-                    self.stop()
-                    time.sleep(0.5)
-                    self.start()
-                    time.sleep(1.0)
-                    continue
-
-            except Exception:
-                pass
-
-            time.sleep(0.5)
 
 
 class DualAudioController:
@@ -625,22 +539,8 @@ class DualAudioController:
         self.vm_ctrl: Optional[ProcessStreamController] = None
 
     def start(self, mic_device_index: int, vm_device_index: int):
-        mic_cfg = StreamConfig(
-            device_index=mic_device_index,
-            label="mic",
-            speaker="A",
-            sample_rate=48000,
-            blocksize=960,
-            channels=2,
-        )
-        vm_cfg = StreamConfig(
-            device_index=vm_device_index,
-            label="vm",
-            speaker="B",
-            sample_rate=48000,
-            blocksize=960,
-            channels=2,
-        )
+        mic_cfg = StreamConfig(device_index=mic_device_index, label="mic", speaker="A")
+        vm_cfg = StreamConfig(device_index=vm_device_index, label="vm", speaker="B")
 
         self.mic_ctrl = ProcessStreamController(mic_cfg, self._dg_key, self._on_text)
         self.vm_ctrl = ProcessStreamController(vm_cfg, self._dg_key, self._on_text)
@@ -655,34 +555,8 @@ class DualAudioController:
             self.vm_ctrl.stop()
 
     def status(self):
-        def pack(ctrl: Optional[ProcessStreamController]):
-            if not ctrl:
-                return {
-                    "status": "stopped",
-                    "rms": 0.0,
-                    "partial": "",
-                    "final": "",
-                    "emit_count": 0,
-                    "bytes_sent": 0,
-                    "msgs_recv": 0,
-                    "queue_drops": 0,
-                    "queue_size": 0,
-                    "last_emit_text": "",
-                    "last_dg_type": "",
-                    "last_dg_error": "",
-                    "last_ws_close": "",
-                    "audio_age_ms": None,
-                    "send_age_ms": None,
-                    "recv_age_ms": None,
-                    "capture_alive": False,
-                    "ipc_connected": False,
-                    "capture_last_log": "",
-                    "capture_last_err": "",
-                    "last_dg_raw": "",
-                    "last_dg_no_transcript": 0,
-                    "capture_error": "",
-                }
-            base = {
+        def empty():
+            return {
                 "status": "stopped",
                 "rms": 0.0,
                 "partial": "",
@@ -706,8 +580,33 @@ class DualAudioController:
                 "last_dg_raw": "",
                 "last_dg_no_transcript": 0,
                 "capture_error": "",
+                "worker_pid": None,
+                "worker_alive": False,
+                "worker_exitcode": None,
             }
-            base.update(ctrl.latest or {})
-            return base
 
-        return {"mic": pack(self.mic_ctrl), "vm": pack(self.vm_ctrl)}
+        mic = empty()
+        vm = empty()
+
+        if self.mic_ctrl:
+            mic.update(self.mic_ctrl.latest or {})
+            # force refresh process health (even if pump thread never ran)
+            if self.mic_ctrl._proc:
+                mic["worker_pid"] = self.mic_ctrl._proc.pid
+                mic["worker_alive"] = self.mic_ctrl._proc.is_alive()
+                mic["worker_exitcode"] = self.mic_ctrl._proc.exitcode
+                if (not mic["worker_alive"]) and mic["worker_exitcode"] is not None and mic["status"] == "starting":
+                    mic["status"] = "audio_error"
+                    mic["capture_error"] = f"worker_exitcode={mic['worker_exitcode']}"
+
+        if self.vm_ctrl:
+            vm.update(self.vm_ctrl.latest or {})
+            if self.vm_ctrl._proc:
+                vm["worker_pid"] = self.vm_ctrl._proc.pid
+                vm["worker_alive"] = self.vm_ctrl._proc.is_alive()
+                vm["worker_exitcode"] = self.vm_ctrl._proc.exitcode
+                if (not vm["worker_alive"]) and vm["worker_exitcode"] is not None and vm["status"] == "starting":
+                    vm["status"] = "audio_error"
+                    vm["capture_error"] = f"worker_exitcode={vm['worker_exitcode']}"
+
+        return {"mic": mic, "vm": vm}
