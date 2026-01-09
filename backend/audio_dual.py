@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import queue
+import math
 import threading
 import time
 import multiprocessing as mp
@@ -11,9 +12,9 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Dict, Any
 
 import aiohttp
-from multiprocessing.connection import Listener
 
-from audio_capture_proc import run_capture_proc
+from engine_client import EngineClient
+from engine_stream import EngineStream
 
 
 def list_audio_devices():
@@ -59,12 +60,27 @@ def build_deepgram_url(sample_rate: int) -> str:
 
 @dataclass
 class StreamConfig:
-    device_index: int
     label: str
     speaker: str
+    host: str
+    port: int
     sample_rate: int = 48000
     blocksize: int = 960
-    channels: int = 2
+
+
+def _pcm_rms_int16(pcm: bytes) -> float:
+    if not pcm:
+        return 0.0
+    if len(pcm) % 2:
+        pcm = pcm[: len(pcm) - 1]
+    samples = memoryview(pcm).cast("h")
+    if not samples:
+        return 0.0
+    total = 0.0
+    for s in samples:
+        total += float(s * s)
+    mean = total / len(samples)
+    return float(math.sqrt(mean) / 32768.0)
 
 
 def _stream_worker_process(
@@ -88,8 +104,6 @@ def _stream_worker_process(
     last_dg_type = ""
     last_dg_error = ""
     last_ws_close = ""
-    last_capture_log = ""
-    last_capture_err = ""
     last_dg_raw = ""
     last_dg_no_transcript = 0
 
@@ -100,15 +114,12 @@ def _stream_worker_process(
 
     q_soft_cap = 200
 
-    ctx = mp.get_context("spawn")
-    listener: Optional[Listener] = None
-    conn = None
-    cap_proc: Optional[mp.Process] = None
-    ipc_connected = False
+    stream = EngineStream(cfg.host, cfg.port, cfg.label, retry_s=10.0)
+    tcp_thread: Optional[threading.Thread] = None
 
     def push_status(extra: Optional[Dict[str, Any]] = None):
-        nonlocal ipc_connected, cap_proc
         now = time.time()
+        tcp_status = stream.status()
         payload = {
             "ts": now,
             "status": "streaming",
@@ -127,12 +138,13 @@ def _stream_worker_process(
             "audio_age_ms": int((now - last_audio_ts) * 1000) if last_audio_ts else None,
             "send_age_ms": int((now - last_send_ts) * 1000) if last_send_ts else None,
             "recv_age_ms": int((now - last_recv_ts) * 1000) if last_recv_ts else None,
-            "capture_alive": bool(cap_proc.is_alive()) if cap_proc else False,
-            "ipc_connected": bool(ipc_connected),
-            "capture_last_log": last_capture_log,
-            "capture_last_err": last_capture_err,
             "last_dg_raw": last_dg_raw,
             "last_dg_no_transcript": int(last_dg_no_transcript),
+            "tcp_connected": tcp_status.connected,
+            "tcp_last_frame_ms": tcp_status.last_frame_ms,
+            "tcp_bytes": tcp_status.bytes,
+            "tcp_drops": tcp_status.drops,
+            "tcp_last_error": tcp_status.last_error,
         }
         if extra:
             payload.update(extra)
@@ -154,76 +166,28 @@ def _stream_worker_process(
         except Exception:
             pass
 
-    def start_capture_proc():
-        nonlocal listener, cap_proc, ipc_connected
-        listener = Listener(("127.0.0.1", 0), authkey=b"shadowcoach")
-        host, port = listener.address
-        cap_proc = ctx.Process(
-            target=run_capture_proc,
-            args=(cfg.device_index, cfg.sample_rate, cfg.channels, cfg.blocksize, host, port),
-            daemon=True,
-        )
-        cap_proc.start()
-        ipc_connected = False
-
-    async def ipc_reader():
-        nonlocal conn, ipc_connected, level, last_audio_ts, last_capture_log, last_capture_err, queue_drops
-        assert listener is not None
-
-        def _accept():
-            return listener.accept()
-
-        try:
-            conn = await asyncio.get_running_loop().run_in_executor(None, _accept)
-            ipc_connected = True
-        except Exception as e:
-            last_capture_err = f"ipc_accept_error: {repr(e)}"
-            ipc_connected = False
-            return
-
+    def tcp_reader():
+        nonlocal level, last_audio_ts, queue_drops
         while not stop_evt.is_set():
-            try:
-                if conn.poll(0.1):
-                    msg = conn.recv()
-                else:
-                    await asyncio.sleep(0.01)
-                    continue
-            except (EOFError, BrokenPipeError, ConnectionResetError):
-                ipc_connected = False
-                break
-            except Exception as e:
-                last_capture_err = f"ipc_recv_error: {repr(e)}"
-                ipc_connected = False
-                break
-
-            try:
-                kind = msg[0]
-            except Exception:
+            frame = stream.read_frame()
+            if frame is None:
+                time.sleep(0.005)
                 continue
 
-            if kind == "pcm":
-                _, ts, rms, pcm16 = msg
-                last_audio_ts = float(ts)
-                level = float(rms)
+            last_audio_ts = time.time()
+            level = _pcm_rms_int16(frame)
 
-                if pcm_q.qsize() >= q_soft_cap:
-                    try:
-                        _ = pcm_q.get_nowait()
-                        queue_drops += 1
-                    except queue.Empty:
-                        pass
-
+            if pcm_q.qsize() >= q_soft_cap:
                 try:
-                    pcm_q.put_nowait(pcm16)
-                except queue.Full:
+                    _ = pcm_q.get_nowait()
                     queue_drops += 1
+                except queue.Empty:
+                    pass
 
-            elif kind == "log":
-                _, text = msg
-                last_capture_log = str(text)[:300]
-            elif kind == "err":
-                _, text = msg
-                last_capture_err = str(text)[:300]
+            try:
+                pcm_q.put_nowait(frame)
+            except queue.Full:
+                queue_drops += 1
 
     async def dg_loop():
         nonlocal bytes_sent, msgs_recv, last_send_ts, last_recv_ts
@@ -346,16 +310,11 @@ def _stream_worker_process(
     loop: Optional[asyncio.AbstractEventLoop] = None
     try:
         push_status({"status": "starting"})
-        start_capture_proc()
+        tcp_thread = threading.Thread(target=tcp_reader, daemon=True)
+        tcp_thread.start()
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
-        ipc_task = loop.create_task(ipc_reader())
-
-        t0 = time.time()
-        while not ipc_connected and (time.time() - t0) < 2.0 and not stop_evt.is_set():
-            loop.run_until_complete(asyncio.sleep(0.05))
 
         backoff = 0.5
         while not stop_evt.is_set():
@@ -369,26 +328,12 @@ def _stream_worker_process(
                 time.sleep(backoff)
                 backoff = min(5.0, backoff * 1.7)
 
-        if not ipc_task.done():
-            ipc_task.cancel()
-
     except Exception as e:
         push_status({"status": "audio_error", "capture_error": repr(e)})
 
     finally:
         try:
-            if cap_proc and cap_proc.is_alive():
-                cap_proc.terminate()
-        except Exception:
-            pass
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-        try:
-            if listener:
-                listener.close()
+            stream.close()
         except Exception:
             pass
         try:
@@ -433,13 +378,14 @@ class ProcessStreamController:
             "audio_age_ms": None,
             "send_age_ms": None,
             "recv_age_ms": None,
-            "capture_alive": False,
-            "ipc_connected": False,
-            "capture_last_log": "",
-            "capture_last_err": "",
             "last_dg_raw": "",
             "last_dg_no_transcript": 0,
             "capture_error": "",
+            "tcp_connected": False,
+            "tcp_last_frame_ms": None,
+            "tcp_bytes": 0,
+            "tcp_drops": 0,
+            "tcp_last_error": "",
             # NEW parent-side fields
             "worker_pid": None,
             "worker_alive": False,
@@ -534,13 +480,35 @@ class DualAudioController:
             raise RuntimeError("Missing DEEPGRAM_API_KEY in environment/.env")
         self._dg_key = dg_key
         self._on_text = on_text
+        self._engine_host = os.getenv("AUDIO_ENGINE_HOST", "127.0.0.1")
+        self._engine_mic_port = int(os.getenv("AUDIO_ENGINE_MIC_PORT", "17711"))
+        self._engine_loop_port = int(os.getenv("AUDIO_ENGINE_LOOP_PORT", "17712"))
+        self._engine = EngineClient(
+            mic_port=self._engine_mic_port,
+            loop_port=self._engine_loop_port,
+            host=self._engine_host,
+            command=os.getenv("AUDIO_ENGINE_CMD"),
+        )
 
         self.mic_ctrl: Optional[ProcessStreamController] = None
         self.vm_ctrl: Optional[ProcessStreamController] = None
 
     def start(self, mic_device_index: int, vm_device_index: int):
-        mic_cfg = StreamConfig(device_index=mic_device_index, label="mic", speaker="A")
-        vm_cfg = StreamConfig(device_index=vm_device_index, label="vm", speaker="B")
+        self._engine.start()
+        self._engine.wait_ready(timeout_s=10.0)
+
+        mic_cfg = StreamConfig(
+            label="mic",
+            speaker="A",
+            host=self._engine_host,
+            port=self._engine_mic_port,
+        )
+        vm_cfg = StreamConfig(
+            label="vm",
+            speaker="B",
+            host=self._engine_host,
+            port=self._engine_loop_port,
+        )
 
         self.mic_ctrl = ProcessStreamController(mic_cfg, self._dg_key, self._on_text)
         self.vm_ctrl = ProcessStreamController(vm_cfg, self._dg_key, self._on_text)
@@ -553,6 +521,7 @@ class DualAudioController:
             self.mic_ctrl.stop()
         if self.vm_ctrl:
             self.vm_ctrl.stop()
+        self._engine.stop()
 
     def status(self):
         def empty():
@@ -573,13 +542,14 @@ class DualAudioController:
                 "audio_age_ms": None,
                 "send_age_ms": None,
                 "recv_age_ms": None,
-                "capture_alive": False,
-                "ipc_connected": False,
-                "capture_last_log": "",
-                "capture_last_err": "",
                 "last_dg_raw": "",
                 "last_dg_no_transcript": 0,
                 "capture_error": "",
+                "tcp_connected": False,
+                "tcp_last_frame_ms": None,
+                "tcp_bytes": 0,
+                "tcp_drops": 0,
+                "tcp_last_error": "",
                 "worker_pid": None,
                 "worker_alive": False,
                 "worker_exitcode": None,
@@ -609,4 +579,18 @@ class DualAudioController:
                     vm["status"] = "audio_error"
                     vm["capture_error"] = f"worker_exitcode={vm['worker_exitcode']}"
 
-        return {"mic": mic, "vm": vm}
+        engine_status = self._engine.status()
+        return {
+            "engine": {
+                "running": engine_status.running,
+                "pid": engine_status.pid,
+                "exit_code": engine_status.exit_code,
+                "last_log": engine_status.last_log,
+                "last_err": engine_status.last_err,
+                "host": self._engine_host,
+                "mic_port": self._engine_mic_port,
+                "loop_port": self._engine_loop_port,
+            },
+            "mic": mic,
+            "vm": vm,
+        }
