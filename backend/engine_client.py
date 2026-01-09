@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -29,7 +31,7 @@ class EngineClient:
         self._host = host
         self._mic_port = int(mic_port)
         self._loop_port = int(loop_port)
-        self._command = command or "audio_engine"
+        self._command = command or self._resolve_default_command()
         self._extra_args = extra_args or []
 
         self._proc: Optional[subprocess.Popen[str]] = None
@@ -37,6 +39,18 @@ class EngineClient:
         self._last_log = ""
         self._last_err = ""
         self._reader_threads: List[threading.Thread] = []
+
+    def _resolve_default_command(self) -> str:
+        env_path = os.getenv("AISC_ENGINE_PATH")
+        if env_path:
+            return env_path
+
+        repo_root = Path(__file__).resolve().parents[1]
+        local_path = repo_root / "audio_engine" / "bin" / "audio_engine.exe"
+        if local_path.exists():
+            return str(local_path)
+
+        return "audio_engine"
 
     def _build_command(self, proof: bool, seconds: int) -> List[str]:
         cmd = shlex.split(self._command)
