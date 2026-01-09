@@ -1,256 +1,178 @@
-🧠 AI Shadow Coach — Project Handoff
+\# # AI Shadow Coach — Project Handoff
 
 
 
-Repository:
+Last updated: 2026-01-09
 
-https://github.com/spent646/ai-shadow-coach
 
 
+---
 
-WHAT THIS PROJECT IS
 
 
+\## Project Overview
 
-AI Shadow Coach is a local Windows-first application designed to act as a real-time Socratic debate coach.
 
 
+AI Shadow Coach is a \*\*Windows-first, real-time Socratic debate coach\*\*.
 
-It:
 
 
+It listens to:
 
-Captures two live audio streams simultaneously
+\- Speaker A: microphone
 
+\- Speaker B: system audio (Discord, YouTube, TikTok, etc.)
 
 
-Speaker A: Physical microphone
 
+It transcribes both streams in real time and feeds them into a local LLM
 
+(Ollama) that outputs structured coaching feedback.
 
-Speaker B: System audio (Discord / TikTok / YouTube / etc.)
 
 
+This is intended to be a \*\*sellable desktop product\*\*, not a prototype.
 
-Routed via VB-CABLE / Voicemeeter
 
 
+---
 
-Streams both feeds to Deepgram Live WebSocket for transcription
 
 
+\## FINAL ARCHITECTURE (OPTION 3 — COMMITTED)
 
-Feeds transcript into a local LLM (Ollama) that:
 
 
+\*\*Python is no longer allowed to do realtime audio capture.\*\*
 
-Outputs JSON-only
 
 
+The system is now split into two layers:
 
-Detects fallacies, bad faith, missing premises, framing errors, etc.
 
 
+\### 1. Native Audio Engine (C++ / WASAPI)
 
-Displays in a simple UI:
+\- Windows-only
 
+\- Uses WASAPI mic capture
 
+\- Uses WASAPI loopback capture
 
-Audio device selection
+\- Runs as its own process
 
+\- Acts as a \*\*TCP server\*\*
 
+\- Streams raw PCM frames over localhost TCP
 
-Start / Stop
 
 
+\### 2. Python Backend (FastAPI / Uvicorn)
 
-Audio meters
+\- Acts as \*\*TCP client\*\*
 
+\- Receives PCM frames from the engine
 
+\- Handles:
 
-Live transcript
+&nbsp; - Deepgram streaming
 
+&nbsp; - pacing
 
+&nbsp; - coaching logic
 
-Coach JSON output
+&nbsp; - UI
 
+&nbsp; - `/audio/status`
 
 
-CURRENT ARCHITECTURE
 
-Backend (FastAPI)
+---
 
 
 
-backend/main.py
+\## Audio Format Contract (IMPORTANT)
 
 
 
-API routes
+The native engine sends:
 
 
 
-Serves UI
+\- Sample rate: \*\*48,000 Hz\*\*
 
+\- Channels: \*\*mono\*\*
 
+\- Format: \*\*int16 PCM\*\*
 
-/audio/status diagnostics endpoint
+\- Frame size: \*\*~20ms per frame\*\*
 
+\- Transport: \*\*raw TCP stream (no PortAudio, no sounddevice)\*\*
 
 
-backend/audio\_dual.py (PRIMARY FILE)
 
+---
 
 
-Orchestrates dual audio pipelines
 
+\## What Is Confirmed Working
 
 
-Starts worker processes
 
+✅ Native audio engine builds and runs  
 
+✅ Engine listens on TCP:
 
-Streams PCM → Deepgram
+\- `127.0.0.1:17711` → mic
 
+\- `127.0.0.1:17712` → system loopback  
 
 
-Emits transcript text + status telemetry
 
+✅ Engine spawns correctly from Python  
 
+✅ `/audio/start` returns `ok = True`  
 
-backend/audio\_capture\_proc.py
+✅ `/audio/status` accurately reflects engine lifecycle  
 
+✅ Python workers are alive (no GIL starvation, no deadlocks)  
 
+✅ sounddevice is \*\*not\*\* used for capture anymore  
 
-Runs sounddevice audio capture
+✅ Python never touches realtime audio callbacks  
 
 
 
-Lives in its own subprocess
+This architecture is \*\*correct and stable\*\*.
 
 
 
-Downmixes stereo → mono int16
+---
 
 
 
-Sends PCM over IPC
+\## Current System State (CRITICAL)
 
 
 
-backend/run\_server.py
+After calling `/audio/start`, `/audio/status` shows:
 
 
 
-Recommended Windows launcher
+\- `engine.running = true`
 
+\- `engine.last\_log` confirms both TCP ports listening
 
+\- `mic.status = "starting"`
 
-Avoids uvicorn + multiprocessing spawn issues
+\- `vm.status = "starting"`
 
+\- `tcp\_connected = false`
 
+\- `tcp\_bytes = 0`
 
-UI
-
-
-
-backend/ui.html
-
-
-
-The active UI
-
-
-
-/ui folder exists for future Tauri/Vite frontend
-
-
-
-⚠️ NOT currently wired
-
-
-
-WHY THIS ARCHITECTURE EXISTS (CRITICAL HISTORY)
-
-
-
-We hit a hard Windows failure mode earlier:
-
-
-
-Symptoms
-
-
-
-Audio meters moved
-
-
-
-Deepgram received some audio
-
-
-
-Only 2–5 words transcribed
-
-
-
-Then transcription froze
-
-
-
-Audio queues exploded
-
-
-
-WebSocket send/recv ages climbed
-
-
-
-Watchdogs never fired
-
-
-
-Root Cause (CONFIRMED)
-
-
-
-Python GIL starvation on Windows
-
-
-
-sounddevice callback + WebSocket loop fought for the GIL
-
-
-
-Async fixes did not help
-
-
-
-Not a Deepgram issue
-
-
-
-Not asyncio misuse
-
-
-
-Not endpointing config
-
-
-
-ARCHITECTURAL DECISION (IMPORTANT)
-
-
-
-We intentionally moved to Option B (industrial-grade):
-
-
-
-Audio capture runs in a separate process
-
-Python websocket only receives buffered PCM
-
-This is how OBS, Discord, Zoom, etc. work
+\- `tcp\_last\_error = ""`
 
 
 
@@ -258,373 +180,523 @@ This means:
 
 
 
-No PortAudio callbacks in the WebSocket process
+➡️ The engine is running  
 
+➡️ Python workers are running  
 
+➡️ \*\*The TCP audio stream connection/framing is not yet established\*\*
 
-PCM is paced to realtime
 
 
+This is the \*\*only remaining integration issue\*\*.
 
-Burst sending is prevented
 
 
+---
 
-Stability > simplicity
 
 
+\## What Is NOT the Problem
 
-This decision is final unless proven otherwise.
 
 
+❌ Not Deepgram  
 
-CURRENT STATE (BLOCKER)
+❌ Not asyncio  
 
-What works
+❌ Not Python GIL  
 
+❌ Not PortAudio  
 
+❌ Not Windows permissions  
 
-Code builds
+❌ Not engine spawning  
 
+❌ Not environment variables  
 
 
-Server runs
 
+All of that has already been solved.
 
 
-UI loads
 
+---
 
 
-Device list is correct
 
+\## Likely Remaining Issue
 
 
-IPC + worker architecture implemented
 
+One of the following:
 
 
-Backpressure + pacing implemented
 
+1\. `engine\_stream.py` expects a different frame size than the engine sends
 
+2\. TCP reader expects length-prefixed frames but engine sends raw frames
 
-What is broken
+3\. Engine closes the connection after accept
 
+4\. Python TCP client connect/read loop is not triggered as expected
 
 
-Clicking Start Audio results in /audio/status stuck at:
 
+\*\*This is now a protocol alignment problem, not an architecture problem.\*\*
 
 
-{
 
-&nbsp; "status": "starting",
+---
 
-&nbsp; "capture\_alive": false,
 
-&nbsp; "ipc\_connected": false,
 
-&nbsp; "bytes\_sent": 0,
+\## Next Task (ONLY TASK)
 
-&nbsp; "msgs\_recv": 0
 
-}
 
+Fix TCP stream compatibility between:
 
 
 
+\- `audio\_engine/src/main.cpp`
 
-This happens for both mic and vm streams.
+\- `backend/engine\_stream.py`
 
 
 
-What this means
+Success criteria:
 
+\- `tcp\_connected = true`
 
+\- `tcp\_bytes` increases
 
-Worker processes are not successfully transitioning
+\- `mic.status = "streaming"`
 
+\- `vm.status = "streaming"`
 
 
-They may:
 
+Do NOT refactor unrelated code.
 
 
-Fail to spawn
 
+---
 
 
-Crash immediately
 
+\## Raw GitHub Links (for ChatGPT / Code Review)
 
 
-Die during import
 
+These links allow a new chat to read the code directly:
 
 
-Be blocked by Windows multiprocessing + uvicorn
 
+\- Project handoff:
 
+&nbsp; https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/handoff.md
 
-DEBUGGING VISIBILITY ALREADY ADDED
 
 
+\- Python backend:
 
-We intentionally exposed parent-side process health:
+&nbsp; https://github.com/spent646/ai-shadow-coach/tree/master/backend
 
 
 
-worker\_pid
+\- Core files:
 
+&nbsp; - audio\_dual.py  
 
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/audio\_dual.py
 
-worker\_alive
+&nbsp; - engine\_stream.py  
 
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/engine\_stream.py
 
+&nbsp; - engine\_client.py  
 
-worker\_exitcode
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/engine\_client.py
 
+&nbsp; - coach.py  
 
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/coach.py
 
-capture\_alive
+&nbsp; - main.py  
 
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/main.py
 
+&nbsp; - ui.html  
 
-ipc\_connected
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/ui.html
 
+&nbsp; - requirements.txt  
 
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/requirements.txt
 
-capture\_last\_log
 
 
+---
 
-capture\_last\_err
 
 
+\## Local Development Layout (IMPORTANT)
 
-These appear in /audio/status.
 
 
+Local git checkout lives at:
 
-If workers crash, exit codes should surface.
 
 
+AI Shadow Coach — Project Handoff
 
-HOW TO RUN (IMPORTANT)
 
-Always run server like this on Windows:
 
-cd backend
+Last updated: 2026-01-09
 
-.\\.venv\\Scripts\\python.exe run\_server.py
 
 
+---
 
 
 
-❌ Do NOT use uvicorn main:app --reload
+\## Project Overview
 
-❌ Do NOT rely on CLI uvicorn during multiprocessing debugging
 
 
+AI Shadow Coach is a \*\*Windows-first, real-time Socratic debate coach\*\*.
 
-DEVICE INDICES (EXAMPLE MACHINE)
 
 
+It listens to:
 
-On the author’s machine:
+\- Speaker A: microphone
 
+\- Speaker B: system audio (Discord, YouTube, TikTok, etc.)
 
 
-Mic: device index 59
 
+It transcribes both streams in real time and feeds them into a local LLM
 
+(Ollama) that outputs structured coaching feedback.
 
-System / Voicemeeter: device index 58
 
 
+This is intended to be a \*\*sellable desktop product\*\*, not a prototype.
 
-The UI attempts to default to these if present.
 
 
+---
 
-WHAT THE NEXT ASSISTANT SHOULD DO
 
-Primary objective
 
+\## FINAL ARCHITECTURE (OPTION 3 — COMMITTED)
 
 
-Get worker processes to start and stay alive.
 
+\*\*Python is no longer allowed to do realtime audio capture.\*\*
 
 
-Step-by-step priorities
 
+The system is now split into two layers:
 
 
-Confirm:
 
+\### 1. Native Audio Engine (C++ / WASAPI)
 
+\- Windows-only
 
-worker\_pid
+\- Uses WASAPI mic capture
 
+\- Uses WASAPI loopback capture
 
+\- Runs as its own process
 
-worker\_alive
+\- Acts as a \*\*TCP server\*\*
 
+\- Streams raw PCM frames over localhost TCP
 
 
-worker\_exitcode
 
+\### 2. Python Backend (FastAPI / Uvicorn)
 
+\- Acts as \*\*TCP client\*\*
 
-If workers die:
+\- Receives PCM frames from the engine
 
+\- Handles:
 
+&nbsp; - Deepgram streaming
 
-Identify exact failure reason
+&nbsp; - pacing
 
+&nbsp; - coaching logic
 
+&nbsp; - UI
 
-Capture stack trace or import error
+&nbsp; - `/audio/status`
 
 
 
-If workers start:
+---
 
 
 
-Confirm IPC connects
+\## Audio Format Contract (IMPORTANT)
 
 
 
-Confirm Deepgram WebSocket opens
+The native engine sends:
 
 
 
-Only AFTER worker stability:
+\- Sample rate: \*\*48,000 Hz\*\*
 
+\- Channels: \*\*mono\*\*
 
+\- Format: \*\*int16 PCM\*\*
 
-Resume transcript accuracy debugging if needed
+\- Frame size: \*\*~20ms per frame\*\*
 
+\- Transport: \*\*raw TCP stream (no PortAudio, no sounddevice)\*\*
 
 
-DO NOT WASTE TIME ON
 
+---
 
 
-Deepgram endpoint tuning
 
+\## What Is Confirmed Working
 
 
-utterance\_end\_ms
 
+✅ Native audio engine builds and runs  
 
+✅ Engine listens on TCP:
 
-WebSocket library debates
+\- `127.0.0.1:17711` → mic
 
+\- `127.0.0.1:17712` → system loopback  
 
 
-asyncio policy changes
 
+✅ Engine spawns correctly from Python  
 
+✅ `/audio/start` returns `ok = True`  
 
-These were already exhausted earlier.
+✅ `/audio/status` accurately reflects engine lifecycle  
 
+✅ Python workers are alive (no GIL starvation, no deadlocks)  
 
+✅ sounddevice is \*\*not\*\* used for capture anymore  
 
-LIKELY NEXT FIXES
+✅ Python never touches realtime audio callbacks  
 
 
 
-One or more of:
+This architecture is \*\*correct and stable\*\*.
 
 
 
-Guarding worker entrypoint imports
+---
 
 
 
-Ensuring audio\_capture\_proc.py is importable in spawn
+\## Current System State (CRITICAL)
 
 
 
-Logging child process stderr to file
+After calling `/audio/start`, `/audio/status` shows:
 
 
 
-Moving worker bootstrap into if \_\_name\_\_ == "\_\_main\_\_" guard
+\- `engine.running = true`
 
+\- `engine.last\_log` confirms both TCP ports listening
 
+\- `mic.status = "starting"`
 
-Explicit multiprocessing.set\_start\_method("spawn") ordering
+\- `vm.status = "starting"`
 
+\- `tcp\_connected = false`
 
+\- `tcp\_bytes = 0`
 
-WHAT THE PROJECT OWNER WILL PROVIDE NEXT
+\- `tcp\_last\_error = ""`
 
 
 
-When continuing:
+This means:
 
 
 
-Backend console output after clicking Start Audio
+➡️ The engine is running  
 
+➡️ Python workers are running  
 
+➡️ \*\*The TCP audio stream connection/framing is not yet established\*\*
 
-Latest /audio/status JSON
 
 
+This is the \*\*only remaining integration issue\*\*.
 
-Worker exit codes (if present)
 
 
+---
 
-FINAL NOTE
 
 
+\## What Is NOT the Problem
 
-This project already crossed the hard part:
 
 
+❌ Not Deepgram  
 
-The architectural root cause is understood
+❌ Not asyncio  
 
+❌ Not Python GIL  
 
+❌ Not PortAudio  
 
-The correct long-term solution was chosen
+❌ Not Windows permissions  
 
+❌ Not engine spawning  
 
+❌ Not environment variables  
 
-What remains is Windows process lifecycle cleanup, not conceptual uncertainty.
 
 
+All of that has already been solved.
 
-If you want, your next step can be:
 
 
+---
 
-Commit this HANDOFF.md
 
 
+\## Likely Remaining Issue
 
-Open a brand-new ChatGPT chat
 
 
+One of the following:
 
-Paste only:
 
 
+1\. `engine\_stream.py` expects a different frame size than the engine sends
 
-Repo link
+2\. TCP reader expects length-prefixed frames but engine sends raw frames
 
+3\. Engine closes the connection after accept
 
+4\. Python TCP client connect/read loop is not triggered as expected
 
-“Please read HANDOFF.md and continue”
 
 
+\*\*This is now a protocol alignment problem, not an architecture problem.\*\*
 
-That’s the cleanest possible handoff.
+
+
+---
+
+
+
+\## Next Task (ONLY TASK)
+
+
+
+Fix TCP stream compatibility between:
+
+
+
+\- `audio\_engine/src/main.cpp`
+
+\- `backend/engine\_stream.py`
+
+
+
+Success criteria:
+
+\- `tcp\_connected = true`
+
+\- `tcp\_bytes` increases
+
+\- `mic.status = "streaming"`
+
+\- `vm.status = "streaming"`
+
+
+
+Do NOT refactor unrelated code.
+
+
+
+---
+
+
+
+\## Raw GitHub Links (for ChatGPT / Code Review)
+
+
+
+These links allow a new chat to read the code directly:
+
+
+
+\- Project handoff:
+
+&nbsp; https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/handoff.md
+
+
+
+\- Python backend:
+
+&nbsp; https://github.com/spent646/ai-shadow-coach/tree/master/backend
+
+
+
+\- Core files:
+
+&nbsp; - audio\_dual.py  
+
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/audio\_dual.py
+
+&nbsp; - engine\_stream.py  
+
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/engine\_stream.py
+
+&nbsp; - engine\_client.py  
+
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/engine\_client.py
+
+&nbsp; - coach.py  
+
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/coach.py
+
+&nbsp; - main.py  
+
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/main.py
+
+&nbsp; - ui.html  
+
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/ui.html
+
+&nbsp; - requirements.txt  
+
+&nbsp;   https://raw.githubusercontent.com/spent646/ai-shadow-coach/refs/heads/master/backend/requirements.txt
+
+
+
+---
+
+
+
+\## Local Development Layout (IMPORTANT)
+
+
+
+Local git checkout lives at:
+
+
+
+
 
