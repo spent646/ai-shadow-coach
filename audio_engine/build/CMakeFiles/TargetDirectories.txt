@@ -1,0 +1,3 @@
+C:/Users/tmisn/shadow-coach-desktop/audio_engine/build/CMakeFiles/audio_engine.dir
+C:/Users/tmisn/shadow-coach-desktop/audio_engine/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/tmisn/shadow-coach-desktop/audio_engine/build/CMakeFiles/ZERO_CHECK.dir

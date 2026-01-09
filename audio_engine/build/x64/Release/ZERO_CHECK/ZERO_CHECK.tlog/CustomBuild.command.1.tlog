@@ -1,0 +1,10 @@
+^C:\USERS\TMISN\SHADOW-COACH-DESKTOP\AUDIO_ENGINE\BUILD\CMAKEFILES\EF147BB3AD86FA83A9E6DF9176CBC571\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/tmisn/shadow-coach-desktop/audio_engine -BC:/Users/tmisn/shadow-coach-desktop/audio_engine/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/tmisn/shadow-coach-desktop/audio_engine/build/audio_engine.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

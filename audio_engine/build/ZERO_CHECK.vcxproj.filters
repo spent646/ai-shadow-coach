@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\tmisn\shadow-coach-desktop\audio_engine\build\CMakeFiles\ef147bb3ad86fa83a9e6df9176cbc571\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{F0C6CBA8-CE22-3BBA-97B5-4BEBE4A272C3}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
