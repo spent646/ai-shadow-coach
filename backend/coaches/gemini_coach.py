@@ -2,7 +2,7 @@
 
 from typing import List
 from backend.models import TranscriptEvent
-from backend.coaches.base_coach import BaseCoach, SOCRATIC_PROMPT
+from backend.coaches.base_coach import BaseCoach, SOCRATIC_PROMPT, REFLECTION_PROMPT
 
 
 class GeminiCoach(BaseCoach):
@@ -120,3 +120,39 @@ class GeminiCoach(BaseCoach):
         self._add_to_history("assistant", assistant_text)
         
         return assistant_text
+    
+    def generate_reflection(self, transcript_context: List[TranscriptEvent]) -> str:
+        """Generate a periodic Socratic reflection question based on recent transcript.
+        
+        Args:
+            transcript_context: Recent transcript events to analyze
+        
+        Returns:
+            A single focused Socratic question
+        """
+        # Build reflection prompt using base class helper
+        full_prompt = self._build_reflection_prompt(transcript_context)
+        
+        # Call Gemini API
+        try:
+            response = self.model.generate_content(
+                full_prompt,
+                generation_config={
+                    "temperature": 0.8,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 200,
+                }
+            )
+            
+            reflection = response.text.strip()
+            
+            # Handle empty response
+            if not reflection:
+                reflection = "What is the core principle you're trying to establish in this discussion?"
+                
+        except Exception as e:
+            print(f"Gemini API error generating reflection: {e}")
+            reflection = "What underlying assumption are you both working from in this conversation?"
+        
+        return reflection

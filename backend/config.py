@@ -4,6 +4,17 @@ import os
 from typing import Optional
 from pathlib import Path
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    
+    # Get the .env file path relative to this config file
+    # config.py is in backend/, .env is in project root
+    env_path = Path(__file__).parent.parent / ".env"
+    load_dotenv(env_path, override=True)
+except ImportError:
+    pass  # python-dotenv not installed, use system environment variables only
+
 
 class Config:
     """Application configuration from environment variables."""
@@ -24,6 +35,10 @@ class Config:
     
     # Audio engine path
     ENGINE_EXE: str = os.getenv("ENGINE_EXE", "engine/build/Release/audio_engine.exe")
+    
+    # Periodic reflection settings
+    COACH_INTERRUPT_INTERVAL_SECONDS: int = int(os.getenv("COACH_INTERRUPT_INTERVAL_SECONDS", "30"))
+    COACH_CONTEXT_WINDOW_MINUTES: int = int(os.getenv("COACH_CONTEXT_WINDOW_MINUTES", "5"))
     
     @classmethod
     def validate(cls) -> list[str]:

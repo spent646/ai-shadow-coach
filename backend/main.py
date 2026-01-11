@@ -9,6 +9,7 @@ from typing import List, Optional
 import time
 import asyncio
 import json
+import hashlib
 from queue import Queue
 import threading
 
@@ -47,6 +48,9 @@ except Exception as e:
     coach = None
 
 transcript_queue = Queue()  # Thread-safe queue for transcript events
+reflection_queue = Queue()  # Thread-safe queue for auto-reflection messages
+reflection_task: Optional[asyncio.Task] = None  # Background task reference
+last_reflection_hash: str = ""  # Track transcript changes
 
 
 # Request models
@@ -67,6 +71,96 @@ def on_transcript_event(stream: str, text: str, is_final: bool):
     print(f"[TRANSCRIPT] Stream {stream}: {text[:50]}{'...' if len(text) > 50 else ''} (final={is_final})")
 
 
+# Helper functions for reflection system
+def get_recent_transcript(seconds: int) -> List[TranscriptEvent]:
+    """Get transcript events from the last N seconds.
+    
+    Args:
+        seconds: Time window in seconds
+        
+    Returns:
+        List of transcript events within the time window
+    """
+    current_time = time.time()
+    cutoff_time = current_time - seconds
+    
+    # Get all events from queue
+    temp_queue = []
+    while not transcript_queue.empty():
+        temp_queue.append(transcript_queue.get())
+    
+    # Filter by time and put back
+    recent = [e for e in temp_queue if e.ts >= cutoff_time]
+    for event in temp_queue:
+        transcript_queue.put(event)
+    
+    return recent
+
+
+def hash_transcript(events: List[TranscriptEvent]) -> str:
+    """Hash transcript content for change detection.
+    
+    Args:
+        events: List of transcript events
+        
+    Returns:
+        MD5 hash of final transcript texts
+    """
+    final_texts = [e.text for e in events if e.is_final]
+    if not final_texts:
+        return ""
+    return hashlib.md5(''.join(final_texts).encode()).hexdigest()
+
+
+async def periodic_reflection_task():
+    """Background task that generates periodic reflection questions."""
+    global last_reflection_hash
+    
+    while True:
+        try:
+            await asyncio.sleep(Config.COACH_INTERRUPT_INTERVAL_SECONDS)
+            
+            # Skip if interval is 0 (disabled)
+            if Config.COACH_INTERRUPT_INTERVAL_SECONDS == 0:
+                continue
+            
+            # Skip if coach is not initialized
+            if coach is None:
+                continue
+            
+            # Get transcript from last N minutes
+            transcript_events = get_recent_transcript(Config.COACH_CONTEXT_WINDOW_MINUTES * 60)
+            
+            # Skip if empty or unchanged
+            content_hash = hash_transcript(transcript_events)
+            if not transcript_events or content_hash == last_reflection_hash or content_hash == "":
+                continue
+            
+            # Generate reflection
+            print(f"[REFLECTION] Generating reflection based on {len(transcript_events)} events...")
+            reflection = coach.generate_reflection(transcript_events)
+            
+            # Push to queue with metadata
+            reflection_queue.put({
+                "type": "auto_reflection",
+                "text": reflection,
+                "ts": time.time()
+            })
+            
+            last_reflection_hash = content_hash
+            print(f"[REFLECTION] Question generated: {reflection[:80]}{'...' if len(reflection) > 80 else ''}")
+            
+        except asyncio.CancelledError:
+            print("[REFLECTION] Background task cancelled")
+            break
+        except Exception as e:
+            print(f"[REFLECTION] Error in background task: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continue running despite errors
+            continue
+
+
 @app.get("/favicon.ico")
 async def favicon():
     """Return empty favicon to prevent 404 errors."""
@@ -83,17 +177,23 @@ async def serve_ui():
 @app.post("/audio/start")
 async def audio_start():
     """Start the audio engine."""
+    global transcriber, reflection_task, last_reflection_hash
+    
     result = audio_engine.start()
     
     # Initialize transcriber if engine started successfully
     if "status" in result and result["status"] == "started":
-        global transcriber
         transcriber = DeepgramTranscriber()
         transcriber.start_stream("A", lambda text, final: on_transcript_event("A", text, final))
         transcriber.start_stream("B", lambda text, final: on_transcript_event("B", text, final))
         
         # Connect transcriber to audio engine so it receives audio data
         audio_engine.set_transcriber(transcriber)
+        
+        # Start background reflection task
+        last_reflection_hash = ""  # Reset hash
+        reflection_task = asyncio.create_task(periodic_reflection_task())
+        print("[REFLECTION] Background task started")
     
     return result
 
@@ -101,7 +201,22 @@ async def audio_start():
 @app.post("/audio/stop")
 async def audio_stop():
     """Stop the audio engine."""
-    global transcriber
+    global transcriber, reflection_task
+    
+    # Stop background reflection task
+    if reflection_task:
+        reflection_task.cancel()
+        try:
+            await reflection_task
+        except asyncio.CancelledError:
+            pass
+        reflection_task = None
+        print("[REFLECTION] Background task stopped")
+    
+    # Clear reflection queue
+    while not reflection_queue.empty():
+        reflection_queue.get()
+    
     if transcriber:
         transcriber.shutdown()
         transcriber = None
@@ -137,6 +252,42 @@ async def transcript_stream():
                 await asyncio.sleep(0.1)
             except Exception as e:
                 print(f"Error in transcript stream: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable buffering for nginx
+        }
+    )
+
+
+@app.get("/coach/reflections/stream")
+async def reflection_stream():
+    """Stream auto-reflection questions via Server-Sent Events."""
+    
+    async def event_generator():
+        while True:
+            try:
+                # Get reflection from queue (non-blocking)
+                try:
+                    reflection = reflection_queue.get(timeout=1.0)
+                    if reflection:
+                        # Format as SSE
+                        reflection_json = json.dumps(reflection)
+                        yield f"data: {reflection_json}\n\n"
+                except:
+                    # Send heartbeat to keep connection alive
+                    yield ": heartbeat\n\n"
+                
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"Error in reflection stream: {e}")
                 import traceback
                 traceback.print_exc()
                 break

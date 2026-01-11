@@ -168,6 +168,22 @@
             align-self: flex-start;
         }
         
+        .chat-message.auto-reflection {
+            background: #3a2a4a;
+            border-left: 3px solid #9c27b0;
+            align-self: flex-start;
+        }
+        
+        .reflection-indicator {
+            font-size: 0.8rem;
+            color: #bb86fc;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 600;
+        }
+        
         .chat-input-area {
             padding: 1rem;
             border-top: 1px solid #3a3a3a;
@@ -211,7 +227,7 @@
             <div class="chat-content">
                 <div class="chat-messages" id="chatMessages">
                     <div class="chat-message assistant">
-                        <div>I'm your Socratic coach. I'll ask probing questions to help you reflect on your conversations. What would you like to explore?</div>
+                        <div>I'm your AI conversation coach. I can help you analyze and reflect on your conversations. Ask me anything about the transcript, and I'll provide insights and discussion. (I can also use the Socratic method if you ask!)</div>
                     </div>
                 </div>
                 <div class="chat-input-area">
@@ -226,6 +242,7 @@
         const API_BASE = '';
         
         let eventSource = null;
+        let reflectionEventSource = null;
         let audioRunning = false;
         
         // Audio controls
@@ -243,6 +260,7 @@
                     document.getElementById('status').textContent = 'Running';
                     document.getElementById('status').classList.add('active');
                     startTranscriptStream();
+                    startReflectionStream();
                 } else {
                     alert('Failed to start: ' + (result.error || 'Unknown error'));
                 }
@@ -266,6 +284,10 @@
             if (eventSource) {
                 eventSource.close();
                 eventSource = null;
+            }
+            if (reflectionEventSource) {
+                reflectionEventSource.close();
+                reflectionEventSource = null;
             }
             document.getElementById('transcriptContent').innerHTML = '<div style="color: #888; padding: 1rem;">Audio stopped.</div>';
         });
@@ -329,6 +351,60 @@
             
             transcriptContent.appendChild(line);
             transcriptContent.scrollTop = transcriptContent.scrollHeight;
+        }
+        
+        // Reflection streaming
+        function startReflectionStream() {
+            if (reflectionEventSource) {
+                reflectionEventSource.close();
+            }
+            
+            reflectionEventSource = new EventSource(`${API_BASE}/coach/reflections/stream`);
+            
+            reflectionEventSource.onmessage = (event) => {
+                // Handle both cases: with or without 'data: ' prefix
+                let dataStr = event.data;
+                if (dataStr.startsWith('data: ')) {
+                    dataStr = dataStr.substring(6);
+                }
+                
+                // Skip heartbeat messages
+                if (dataStr.trim() === '' || dataStr === 'heartbeat') {
+                    return;
+                }
+                
+                try {
+                    const data = JSON.parse(dataStr);
+                    addReflectionMessage(data);
+                } catch (e) {
+                    console.error('Error parsing reflection event:', e, 'Data:', dataStr);
+                }
+            };
+            
+            reflectionEventSource.onerror = () => {
+                if (audioRunning) {
+                    // Reconnect after delay
+                    setTimeout(startReflectionStream, 2000);
+                }
+            };
+        }
+        
+        function addReflectionMessage(data) {
+            const chatMessages = document.getElementById('chatMessages');
+            const reflectionMsg = document.createElement('div');
+            reflectionMsg.className = 'chat-message auto-reflection';
+            
+            const indicator = document.createElement('div');
+            indicator.className = 'reflection-indicator';
+            indicator.textContent = '💡 Reflection Question';
+            
+            const content = document.createElement('div');
+            content.innerHTML = escapeHtml(data.text).replace(/\n/g, '<br>');
+            
+            reflectionMsg.appendChild(indicator);
+            reflectionMsg.appendChild(content);
+            chatMessages.appendChild(reflectionMsg);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
         }
         
         // Chat
