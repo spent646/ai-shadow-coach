@@ -1,0 +1,49 @@
+"""Configuration management for API keys and settings."""
+
+import os
+from typing import Optional
+from pathlib import Path
+
+
+class Config:
+    """Application configuration from environment variables."""
+    
+    # Deepgram API key (required for transcription)
+    DEEPGRAM_API_KEY: Optional[str] = os.getenv("DEEPGRAM_API_KEY")
+    
+    # Ollama settings (no API key needed, it's local)
+    OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+    
+    # Audio engine path
+    ENGINE_EXE: str = os.getenv("ENGINE_EXE", "engine/build/Release/audio_engine.exe")
+    
+    @classmethod
+    def validate(cls) -> list[str]:
+        """Validate configuration and return list of missing required settings."""
+        missing = []
+        
+        # Deepgram is optional for Phase 1 (transcription not implemented yet)
+        # Uncomment when implementing Deepgram:
+        # if not cls.DEEPGRAM_API_KEY:
+        #     missing.append("DEEPGRAM_API_KEY")
+        
+        return missing
+    
+    @classmethod
+    def get_deepgram_key(cls) -> Optional[str]:
+        """Get Deepgram API key, checking environment and .env file."""
+        if cls.DEEPGRAM_API_KEY:
+            return cls.DEEPGRAM_API_KEY
+        
+        # Try loading from .env file if python-dotenv is available
+        try:
+            from dotenv import load_dotenv
+            env_path = Path(__file__).parent.parent / ".env"
+            if env_path.exists():
+                load_dotenv(env_path)
+                return os.getenv("DEEPGRAM_API_KEY")
+        except ImportError:
+            pass
+        
+        return None
