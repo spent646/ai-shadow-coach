@@ -11,9 +11,16 @@ class Config:
     # Deepgram API key (required for transcription)
     DEEPGRAM_API_KEY: Optional[str] = os.getenv("DEEPGRAM_API_KEY")
     
+    # Coach settings
+    COACH_TYPE: str = os.getenv("COACH_TYPE", "gemini")  # "ollama" or "gemini"
+    
     # Ollama settings (no API key needed, it's local)
     OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+    
+    # Gemini settings
+    GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
     
     # Audio engine path
     ENGINE_EXE: str = os.getenv("ENGINE_EXE", "engine/build/Release/audio_engine.exe")
@@ -22,6 +29,10 @@ class Config:
     def validate(cls) -> list[str]:
         """Validate configuration and return list of missing required settings."""
         missing = []
+        
+        # Check coach-specific requirements
+        if cls.COACH_TYPE == "gemini" and not cls.GEMINI_API_KEY:
+            missing.append("GEMINI_API_KEY (required when COACH_TYPE=gemini)")
         
         # Deepgram is optional for Phase 1 (transcription not implemented yet)
         # Uncomment when implementing Deepgram:

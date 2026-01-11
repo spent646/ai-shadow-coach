@@ -15,7 +15,8 @@ import threading
 from backend.models import TranscriptEvent, CoachMessage
 from backend.audio_engine import AudioEngine
 from backend.transcriber import DeepgramTranscriber
-from backend.coach import Coach
+from backend.coaches import create_coach
+from backend.config import Config
 
 app = FastAPI(title="AI Shadow Coach v1")
 
@@ -31,7 +32,20 @@ app.add_middleware(
 # Global state
 audio_engine = AudioEngine()
 transcriber: Optional[DeepgramTranscriber] = None
-coach = Coach()
+
+# Initialize coach based on configuration
+try:
+    coach = create_coach(Config.COACH_TYPE)
+    print(f"Coach initialized: {Config.COACH_TYPE}")
+except ValueError as e:
+    print(f"ERROR: {e}")
+    print(f"Falling back to Gemini coach...")
+    coach = create_coach("gemini")
+except Exception as e:
+    print(f"ERROR initializing coach: {e}")
+    print("Please check your configuration and API keys.")
+    coach = None
+
 transcript_queue = Queue()  # Thread-safe queue for transcript events
 
 
@@ -141,6 +155,12 @@ async def transcript_stream():
 @app.post("/coach/chat")
 async def coach_chat(request: ChatRequest):
     """Send message to coach and get response."""
+    if coach is None:
+        return {
+            "response": "Error: Coach not initialized. Please check your configuration.",
+            "history": []
+        }
+    
     # Get recent transcript context (last 20 events)
     recent_events = []
     temp_queue = []
@@ -162,6 +182,8 @@ async def coach_chat(request: ChatRequest):
 @app.get("/coach/history")
 async def coach_history():
     """Get coach conversation history."""
+    if coach is None:
+        return {"history": []}
     return {"history": coach.get_history()}
 
 

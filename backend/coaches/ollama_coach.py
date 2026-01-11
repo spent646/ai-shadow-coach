@@ -1,33 +1,25 @@
 """Ollama coach with Socratic questioning behavior."""
 
 import requests
-import time
-from typing import List, Dict
-from backend.models import CoachMessage, TranscriptEvent
+from typing import List
+from backend.models import TranscriptEvent
+from backend.coaches.base_coach import BaseCoach, SOCRATIC_PROMPT
 
 
-SOCRATIC_PROMPT = """You are a Socratic coach helping someone reflect on their conversations. Your default behavior is to ask probing questions that:
-- Challenge assumptions
-- Seek definitions and clarity
-- Offer counterexamples
-- Identify contradictions
-- Encourage deeper thinking
-
-When the user asks a direct question, you can answer it, but still try to include 1-2 Socratic follow-ups.
-
-Default behavior: Return 3-7 Socratic questions per turn, formatted as a numbered list.
-
-Only give direct answers if explicitly requested."""
-
-
-class Coach:
+class OllamaCoach(BaseCoach):
     """Ollama-based Socratic coach."""
     
     def __init__(self, ollama_url: str = None, model: str = None):
+        """Initialize Ollama coach.
+        
+        Args:
+            ollama_url: URL of Ollama server (defaults to Config.OLLAMA_URL)
+            model: Model name to use (defaults to Config.OLLAMA_MODEL)
+        """
+        super().__init__()
         from backend.config import Config
         self.ollama_url = ollama_url or Config.OLLAMA_URL
         self.model = model or Config.OLLAMA_MODEL
-        self.conversation_history: List[CoachMessage] = []
     
     def chat(self, user_message: str, transcript_context: List[TranscriptEvent] = None) -> str:
         """Send message to coach and get response.
@@ -39,25 +31,11 @@ class Coach:
         Returns:
             Assistant's response text
         """
-        # Build context prompt
-        context_parts = [SOCRATIC_PROMPT]
-        
-        if transcript_context:
-            context_parts.append("\n\nRecent conversation transcript:")
-            for event in transcript_context[-20:]:  # Last 20 events
-                context_parts.append(f"[{event.stream}] {event.text}")
-        
-        context_parts.append(f"\n\nUser question: {user_message}")
-        context_parts.append("\n\nRespond with Socratic questions (3-7 questions):")
-        
-        full_prompt = "\n".join(context_parts)
+        # Build context prompt using base class helper
+        full_prompt = self._build_context_prompt(user_message, transcript_context)
         
         # Add to conversation history
-        self.conversation_history.append(CoachMessage(
-            role="user",
-            text=user_message,
-            ts=time.time()
-        ))
+        self._add_to_history("user", user_message)
         
         # Call Ollama
         try:
@@ -87,14 +65,6 @@ class Coach:
             print(f"Unexpected error calling Ollama: {e}")
         
         # Add to conversation history
-        self.conversation_history.append(CoachMessage(
-            role="assistant",
-            text=assistant_text,
-            ts=time.time()
-        ))
+        self._add_to_history("assistant", assistant_text)
         
         return assistant_text
-    
-    def get_history(self) -> List[Dict]:
-        """Get conversation history."""
-        return [msg.to_dict() for msg in self.conversation_history]
